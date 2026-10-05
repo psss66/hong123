@@ -922,6 +922,18 @@ body {
         <div class="history-section-title">歷史紀錄</div>
         <div id="history-list"></div>
       </div>
+
+      <!-- Backup Section -->
+      <div class="card" id="backup-card" style="margin-top:16px;">
+        <div class="section-title">資料備份</div>
+        <div class="aux-text" id="backup-last" style="margin-bottom:12px;"></div>
+        <div style="display:flex;gap:10px;">
+          <button class="btn-secondary" style="flex:1;height:44px;font-size:14px;" onclick="exportBackup()">匯出備份</button>
+          <button class="btn-secondary" style="flex:1;height:44px;font-size:14px;" onclick="document.getElementById('backup-file').click()">匯入備份</button>
+        </div>
+        <input type="file" id="backup-file" accept=".json,application/json" style="display:none" onchange="importBackup(this)">
+        <div class="aux-text" style="font-size:12px;margin-top:10px;">備份檔包含修持記錄與問事管理資料，請妥善保管。</div>
+      </div>
     </div>
 
 
@@ -1107,6 +1119,8 @@ function getStreak(data) {
     const rec = data[key];
     if (rec && SUTRAS.some(su => (rec[su.name] || 0) > 0)) {
       streak++;
+    } else if (i === 0) {
+      continue; // 今天還沒記錄，不中斷，從昨天起算
     } else {
       break;
     }
@@ -1588,6 +1602,7 @@ function editCalDate() {
 
 // ===== SUMMARY PAGE =====
 function renderSummary() {
+  refreshBackupInfo();
   const now = new Date();
   if (sumViewYear === undefined) { sumViewYear = now.getFullYear(); sumViewMonth = now.getMonth() + 1; }
   buildSummary();
@@ -1641,12 +1656,14 @@ function buildRedemption(data, y, m) {
   for (var i = 0; i < REDEMPTION.length; i++) {
     var rule = REDEMPTION[i];
     var mt = getMonthSutraTotal(data, y, m, rule.name);
-    var yq = Math.floor(mt / rule.yuanqin);
-    var zz = Math.floor(mt / rule.zhuzhu);
+    var cumBefore = getCumulative(data, rule.name, getDateKey(y, m, 1), false);
+    var cumEnd = getCumulative(data, rule.name, getDateKey(y, m, 31), true);
+    var yq = Math.floor(cumEnd / rule.yuanqin) - Math.floor(cumBefore / rule.yuanqin);
+    var zz = Math.floor(cumEnd / rule.zhuzhu) - Math.floor(cumBefore / rule.zhuzhu);
     monthGrandTotal += mt;
     totalYuanqin += yq;
     totalZhuzhu  += zz;
-    rows.push({ name: rule.name, yq: yq, zz: zz });
+    rows.push({ name: rule.name, yq: yq, zz: zz, cum: cumEnd, rule: rule });
   }
 
   // All-time totals
@@ -1717,6 +1734,27 @@ function buildRedemption(data, y, m) {
   table.appendChild(tbody);
   card.appendChild(table);
 
+  // Remainders carried over (as of end of viewed month)
+  var remWrap = document.createElement('div');
+  remWrap.style.cssText = 'padding:10px 16px 8px;border-top:1px solid var(--border);';
+  var remTitle = document.createElement('div');
+  remTitle.className = 'redemption-sub-text';
+  remTitle.style.marginBottom = '6px';
+  remTitle.textContent = '\u622a\u81f3\u672c\u6708\u5e95\uff0c\u7d2f\u8a08\u9918\u6578\uff08\u8de8\u6708\u7d9c\u7e8c\u7d2f\u8a08\uff09';
+  remWrap.appendChild(remTitle);
+  rows.forEach(function(r) {
+    var a = r.rule.yuanqin - (r.cum % r.rule.yuanqin);
+    var b = r.rule.zhuzhu - (r.cum % r.rule.zhuzhu);
+    var line = document.createElement('div');
+    line.className = 'aux-text';
+    line.style.cssText = 'font-size:13px;margin-bottom:3px;';
+    line.textContent = r.name + '\uff1a\u7d2f\u8a08 ' + r.cum + ' \u904d\uff0c' +
+      (a === b ? '\u518d ' + a + ' \u904d\u6eff\u4e0b\u4e00\u4f4d'
+               : '\u518d ' + a + ' \u904d\u6eff\u4e0b\u4e00\u4f4d\u51a4\u89aa\u3001\u518d ' + b + ' \u904d\u6eff\u4e0b\u4e00\u4f4d\u50b5\u4e3b');
+    remWrap.appendChild(line);
+  });
+  card.appendChild(remWrap);
+
   // History line
   if (allYq > 0 || allZz > 0) {
     var histWrap = document.createElement('div');
@@ -1729,6 +1767,16 @@ function buildRedemption(data, y, m) {
   }
 
   container.appendChild(card);
+}
+
+function getCumulative(data, sutraName, boundKey, inclusive) {
+  var total = 0;
+  Object.keys(data).forEach(function(k) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(k) && data[k] && (inclusive ? k <= boundKey : k < boundKey)) {
+      total += (data[k][sutraName] || 0);
+    }
+  });
+  return total;
 }
 
 function getAllTimeSutraTotal(data, sutraName) {
@@ -1830,6 +1878,84 @@ function migrateOldSutraName() {
   } catch(e) {}
 }
 
+
+// ===== Backup / Restore =====
+var EXPENSE_KEYS = ['hongjun.records.creditor','hongjun.records.inquiry','hongjun.records.treasury','hongjun.records.grievance'];
+var LAST_BACKUP_KEY = 'sutraLastBackup';
+
+function refreshBackupInfo() {
+  var el = document.getElementById('backup-last');
+  if (!el) return;
+  var t = null;
+  try { t = localStorage.getItem(LAST_BACKUP_KEY); } catch(e) {}
+  if (!t) { el.textContent = '尚未備份過，建議定期匯出。'; return; }
+  var d = new Date(t);
+  var days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  el.textContent = '上次備份：' + d.getFullYear() + '/' + (d.getMonth()+1) + '/' + d.getDate() +
+    (days >= 30 ? '（已超過 ' + days + ' 天，建議重新備份）' : '');
+}
+
+async function exportBackup() {
+  if (!_storageOk) { showToast('此瀏覽器不支援本地儲存'); return; }
+  var payload = { app: 'sutra-tracker', version: 1, exportedAt: new Date().toISOString(),
+                  sutraTrackerData: loadData(), expense: {} };
+  EXPENSE_KEYS.forEach(function(k) {
+    try { var v = localStorage.getItem(k); if (v !== null) payload.expense[k] = v; } catch(e) {}
+  });
+  var name = '修持記錄備份_' + getTodayKey().replace(/-/g, '') + '.json';
+  var text = JSON.stringify(payload);
+  try {
+    var file = new File([text], name, { type: 'application/json' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+    } else {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+      a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function() { URL.revokeObjectURL(a.href); }, 5000);
+    }
+    localStorage.setItem(LAST_BACKUP_KEY, new Date().toISOString());
+    refreshBackupInfo();
+    showToast('備份已匯出 ✓');
+  } catch(e) {
+    if (e && e.name === 'AbortError') return; // 使用者取消分享
+    showToast('匯出失敗');
+  }
+}
+
+function importBackup(input) {
+  var f = input.files && input.files[0];
+  input.value = '';
+  if (!f) return;
+  var reader = new FileReader();
+  reader.onload = function() {
+    var p;
+    try { p = JSON.parse(reader.result); } catch(e) { showToast('檔案格式錯誤'); return; }
+    if (!p || p.app !== 'sutra-tracker' || typeof p.sutraTrackerData !== 'object' || p.sutraTrackerData === null) {
+      showToast('這不是有效的備份檔'); return;
+    }
+    var incoming = p.sutraTrackerData;
+    var n = Object.keys(incoming).filter(function(k) { return /^\d{4}-\d{2}-\d{2}$/.test(k); }).length;
+    if (!confirm('將匯入 ' + n + ' 天的修持記錄。\n同日期會以備份檔為準，其餘日期保留。\n\n確定匯入？')) return;
+    var data = loadData();
+    Object.keys(incoming).forEach(function(k) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(k) && incoming[k] && typeof incoming[k] === 'object') data[k] = incoming[k];
+    });
+    saveData(data);
+    var exp = p.expense && typeof p.expense === 'object' ? p.expense : {};
+    var hasExp = EXPENSE_KEYS.some(function(k) { return typeof exp[k] === 'string'; });
+    if (hasExp && confirm('備份檔也包含問事管理資料。\n要還原嗎？（會取代目前的問事管理資料）')) {
+      EXPENSE_KEYS.forEach(function(k) {
+        if (typeof exp[k] === 'string') { try { localStorage.setItem(k, exp[k]); } catch(e) {} }
+      });
+    }
+    showToast('匯入完成 ✓');
+    setTimeout(function() { location.reload(); }, 600);
+  };
+  reader.readAsText(f);
+}
+
 // ===== Init =====
 function init() {
   const now = new Date();
@@ -1838,6 +1964,9 @@ function init() {
   sumViewYear = now.getFullYear();
   sumViewMonth = now.getMonth() + 1;
   recordSelectedDate = getTodayKey();
+
+  // Ask browser to keep storage (reduces risk of eviction)
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e) {}
 
   // Migrate old sutra name data
   migrateOldSutraName();
